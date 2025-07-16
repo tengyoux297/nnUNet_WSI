@@ -35,6 +35,20 @@ from nnunetv2.utilities.label_handling.label_handling import determine_num_input
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 from nnunetv2.utilities.utils import create_lists_from_splitted_dataset_folder
 
+# Add OpenSlide import
+try:
+    import openslide
+except ImportError:
+    print("Warning: OpenSlide not available. Install with: pip install openslide-python")
+    openslide = None
+
+# Add centroid detection imports
+try:
+    from skimage import filters, measure, morphology
+except ImportError:
+    print("Warning: scikit-image not available. Install with: pip install scikit-image")
+    filters = measure = morphology = None
+
 
 class nnUNetPredictor(object):
     def __init__(self,
@@ -45,7 +59,8 @@ class nnUNetPredictor(object):
                  device: torch.device = torch.device('cuda'),
                  verbose: bool = False,
                  verbose_preprocessing: bool = False,
-                 allow_tqdm: bool = True):
+                 allow_tqdm: bool = True,
+                 sliding_window_batch_size: int = 4):
         self.verbose = verbose
         self.verbose_preprocessing = verbose_preprocessing
         self.allow_tqdm = allow_tqdm
@@ -63,6 +78,7 @@ class nnUNetPredictor(object):
             perform_everything_on_device = False
         self.device = device
         self.perform_everything_on_device = perform_everything_on_device
+        self.sliding_window_batch_size = sliding_window_batch_size
 
     def initialize_from_trained_model_folder(self, model_training_output_dir: str,
                                              use_folds: Union[Tuple[Union[int, str]], None],
@@ -419,6 +435,263 @@ class nnUNetPredictor(object):
         # clear device cache
         empty_cache(self.device)
         return ret
+
+    def predict_from_whole_slide(self,
+                                slide_path: str,
+                                tile_size: int = 5120,
+                                tile_stride_size: int = 2560,
+                                patch_size: int = 512,
+                                patch_step_size: int = 256,
+                                batch_size: int = 32,
+                                num_workers: int = 24,
+                                detect_centroids: bool = False,
+                                centroid_threshold: float = 0.1):
+        """
+        Predict segmentation from a whole slide image (TIF/SVS format) using a dataloader approach.
+        
+        Args:
+            slide_path: Path to the whole slide image file
+            tile_size: Size of tiles to extract (width, height)
+            step_size: Step size between tiles (stride)
+            batch_size: Batch size for model inference
+            num_workers: Number of workers for data loading
+            return_probabilities: Whether to return probability maps
+            detect_centroids: Whether to detect centroids from the segmentation
+            centroid_threshold: Threshold for centroid detection
+            
+        Returns:
+            Dictionary containing:
+            - 'segmentation': Full slide segmentation mask
+            - 'probabilities': Probability maps (if return_probabilities=True)
+            - 'centroids': List of detected centroids (if detect_centroids=True)
+            - 'slide_properties': Original slide properties
+            - 'tile_predictions': List of individual tile predictions
+        """
+        if openslide is None:
+            raise ImportError("OpenSlide is required for whole slide prediction. Install with: pip install openslide-python")
+        
+        # No normalization needed - predict_single_npy_array handles preprocessing
+        
+        # Centroid detection function (copied from reference implementation)
+        def load_centroid(sal_map, threshold_adj=1.0):
+            """Extract centroids from a saliency map"""
+            if measure is None or morphology is None:
+                raise ImportError("scikit-image is required for centroid detection. Install with: pip install scikit-image")
+            
+            threshold = threshold_adj
+            
+            if threshold >= np.max(sal_map):
+                threshold = np.max(sal_map)
+            
+            mask = sal_map > threshold
+            mask = morphology.remove_small_objects(mask, 50)
+            mask = morphology.remove_small_holes(mask, 50)
+            labels = measure.label(mask)
+            
+            props = measure.regionprops(labels, mask)
+            
+            centroid_set = []
+            
+            for each_prop in props:
+                y0, x0 = each_prop.centroid
+                centroid_set.append([int(x0), int(y0)])
+            
+            return centroid_set
+        
+        # Centroid detection class for multiprocessing
+        class CentroidDetector:
+            def __init__(self, threshold=0.1):
+                self.threshold = threshold
+            
+            def detect_centroids_from_tile(self, tile_probs, tile_x, tile_y, tile_size=1024, patch_size=512, step_size=256):
+                """Detect centroids from a single tile probability map"""
+                det_list = []
+                
+                # Create probability map for the tile (assuming class 1 is the target class)
+                prob_map = np.zeros((tile_size, tile_size))
+                
+                # Calculate ranges for patches within the tile
+                ranges = [np.arange(0, tile_size-patch_size+1, step_size), 
+                         np.arange(0, tile_size-patch_size+1, step_size)]
+                s = 0
+                
+                # Place probability predictions back in the tile
+                for i in ranges[0]:
+                    for j in ranges[1]:
+                        if s < len(tile_probs):
+                            # tile_probs[s] has shape (num_classes, H, W)
+                            # We want the probability of class 1 (assuming it's the target class)
+                            class1_prob = tile_probs[s][1] if tile_probs[s].shape[0] > 1 else tile_probs[s][0]
+                            ori_patch = prob_map[i:i+patch_size, j:j+patch_size]
+                            max_prob = np.maximum(ori_patch, class1_prob)
+                            prob_map[i:i+patch_size, j:j+patch_size] = max_prob
+                            s += 1
+                
+                # Detect centroids from the probability map
+                det_set = load_centroid(prob_map, self.threshold)
+                
+                # Convert to global coordinates
+                if len(det_set) > 0:
+                    for each_centroid in det_set:
+                        det_list.append([int(each_centroid[0] + tile_x), int(each_centroid[1] + tile_y)])
+                
+                return det_list
+        
+        # Create custom dataset class
+        class WholeSlideDataset(torch.utils.data.Dataset):
+            def __init__(self, slide_path, tile_size, tile_stride_size, patch_size, patch_step_size):
+                super().__init__()
+                
+                self.wsi = openslide.open_slide(slide_path)
+                self.tile_size = tile_size
+                self.tile_stride_size = tile_stride_size
+                self.patch_size = patch_size
+                self.patch_step_size = patch_step_size
+                img_dim = self.wsi.dimensions
+                
+                # Create task list for all tile positions
+                region_x_list = np.arange(0, img_dim[0], tile_stride_size)
+                region_y_list = np.arange(0, img_dim[1], tile_stride_size)
+
+                task_list = []
+                for each_x in region_x_list:
+                    for each_y in region_y_list:
+                        task_list.append([each_x, each_y])
+                
+                self.task_list = task_list
+                print(f'Slide dimensions: {img_dim}, Number of tiles: {len(task_list)}')
+            
+            def __getitem__(self, i):
+                # Read tile from slide
+                each_task = self.task_list[i]
+                img_np = np.array(self.wsi.read_region(
+                    location=(each_task[0], each_task[1]), 
+                    level=0, 
+                    size=(self.tile_size, self.tile_size)
+                ))[:,:,:3]
+                
+                # Check if tile is mostly white/empty (similar to reference implementation)
+                diag_sum = np.mean(img_np[:,:,0])
+                
+                if diag_sum <= 225 and diag_sum >= 30:
+                    # Extract patches within the tile
+                    x_dim, y_dim, _ = img_np.shape
+                    patch_size = self.patch_size  # Fixed patch size for nnU-Net
+                    
+                    img_ranges = [
+                        np.arange(0, x_dim-patch_size+1, self.patch_step_size), 
+                        np.arange(0, y_dim-patch_size+1, self.patch_step_size)
+                    ]
+                    
+                    patch_list = []
+                    for i in img_ranges[0]:
+                        for j in img_ranges[1]:
+                            each_patch = img_np[i:i+patch_size, j:j+patch_size, :]
+                            patch_list.append(each_patch)
+                    
+                    # Convert to numpy format for predict_single_npy_array
+                    new_sub_list = np.array(patch_list)  # (N, H, W, C) - raw RGB values
+                    
+                    return new_sub_list, each_task
+                else:
+                    return [], each_task
+            
+            def __len__(self):
+                return len(self.task_list)
+        
+        # Create custom collate function
+        def collate_fn(batch):
+            return tuple(zip(*batch))
+        
+        # Create custom DataLoader with background prefetching
+        class DataLoaderX(torch.utils.data.DataLoader):
+            def __iter__(self):
+                return BackgroundGenerator(super().__iter__())
+        
+        # Background generator for prefetching
+        class BackgroundGenerator:
+            def __init__(self, generator):
+                self.generator = generator
+                self.queue = Queue(maxsize=2)
+                self.thread = Thread(target=self._prefetch, daemon=True)
+                self.thread.start()
+            
+            def _prefetch(self):
+                try:
+                    for item in self.generator:
+                        self.queue.put(item)
+                    self.queue.put(None)
+                except Exception as e:
+                    self.queue.put(e)
+            
+            def __iter__(self):
+                return self
+            
+            def __next__(self):
+                item = self.queue.get()
+                if item is None:
+                    raise StopIteration
+                if isinstance(item, Exception):
+                    raise item
+                return item
+        
+        # Create dataset and dataloader
+        dataset = WholeSlideDataset(slide_path, tile_size, tile_stride_size, patch_size, patch_step_size)
+        dataloader = DataLoaderX(
+            dataset, 
+            batch_size=batch_size, 
+            collate_fn=collate_fn,
+            shuffle=False, 
+            num_workers=num_workers, 
+            pin_memory=False
+        )
+        
+        # Process tiles in batches
+        all_positions = []
+        all_centroids = []
+        
+        # Initialize centroid detector if needed
+        centroid_detector = None
+        if detect_centroids:
+            centroid_detector = CentroidDetector(threshold=centroid_threshold)
+        
+        self.network.eval()
+        with torch.no_grad():
+            for patch_list, each_loc_list in tqdm(dataloader, desc="Processing tiles"):
+                for each_patch_list, each_loc in zip(patch_list, each_loc_list):
+                    if len(each_patch_list) > 0:
+                        # Process patches using direct network prediction for 2D RGB images
+                        # Convert patches to tensor format for nnU-Net
+                        patch_tensors = []
+                        for i in range(each_patch_list.shape[0]):
+                            # Convert from (H, W, C) to (C, H, W) format
+                            patch = each_patch_list[i].transpose(2, 0, 1)  # (C, H, W)
+                            # Normalize to [0, 1] range
+                            patch = patch.astype(np.float32) / 255.0
+                            patch_tensors.append(torch.from_numpy(patch))
+                        
+                        # Stack into batch tensor
+                        batch_tensor = torch.stack(patch_tensors, dim=0).to(self.device)  # (N, C, H, W)
+                        
+                        # Get predictions directly from network
+                        with torch.no_grad():
+                            # Ensure network is on the same device as input
+                            self.network = self.network.to(self.device)
+                            batch_logits = self.network(batch_tensor)  # (N, num_classes, H, W)
+                        
+                        # Detect centroids if requested
+                        if detect_centroids and centroid_detector is not None:
+                            tile_x, tile_y = each_loc
+                            # Convert logits to probabilities for centroid detection
+                            batch_probs_for_centroids = torch.softmax(batch_logits, dim=1).cpu().numpy()
+                            tile_centroids = centroid_detector.detect_centroids_from_tile(
+                                batch_probs_for_centroids, tile_x, tile_y, 
+                                tile_size=tile_size, patch_size=patch_size, step_size=patch_step_size
+                            )
+                            all_centroids.extend(tile_centroids)
+        
+        # Return only centroids list
+        return all_centroids
 
     def predict_single_npy_array(self, input_image: np.ndarray, image_properties: dict,
                                  segmentation_previous_stage: np.ndarray = None,
